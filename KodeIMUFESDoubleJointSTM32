@@ -1,0 +1,1616 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+//#include <math.h>
+//#include <stdio.h>
+//#include <string.h>
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+typedef struct
+{
+    float x1, x2, y1, y2;
+}
+BiquadLPFState;
+
+typedef struct
+{
+    float angle, bias;
+    float p00, p01, p10, p11;
+}
+Kalman1DState;
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+/* ================================================================
+ *  FITUR TAMBAHAN — Toggle via macro
+ * ================================================================ */
+
+/* UART Start/Stop Trigger: 'd' = start, 'g' = stop
+ *   1 = FES menunggu trigger UART sebelum aktif (lebih aman)
+ *   0 = FES langsung aktif saat power-on */
+#define ENABLE_UART_TRIGGER  1
+
+/* Trajectory Pattern Type:
+ *   0 = Sinusoidal (default asli)
+ *   1 = Trapezoidal (port dari KodeKating, memberikan fase istirahat) */
+#define TRAJ_PATTERN_TYPE    1
+
+/* Parameter Trapezoidal Trajectory */
+#define T_RISE  2.0f   /* Waktu fase naik (detik) */
+#define T_PEAK  2.0f   /* Waktu fase tahan puncak (detik) */
+#define T_FALL  2.0f   /* Waktu fase turun (detik) */
+#define T_BASE  2.0f   /* Waktu fase dasar/istirahat (detik) */
+#define T_TOTAL (T_RISE + T_PEAK + T_FALL + T_BASE)  /* Total satu periode */
+
+/* Fuzzy-PID Intensity Control:
+ *   1 = output FES = gabungan Fuzzy ICA + PID (port dari KodeKating)
+ *   0 = output FES = PID murni (default asli) */
+#define ENABLE_FUZZY_CONTROL 1
+
+/* Bobot kombinasi Fuzzy-PID */
+#define FUZZY_WEIGHT_CA   0.4f   /* bobot Fuzzy ICA */
+#define FUZZY_WEIGHT_FDBK 0.6f   /* bobot PID feedback */
+
+/* ----------------------------------------------------------------
+ *  Parameter Membership Function Fuzzy — WRIST joint
+ *
+ *  Input 1: sudut sendi wrist (wrist_joint_angle, deg)
+ *    Low  : nilai sekitar 0-15° (hampir lurus / istirahat)
+ *    Med  : nilai sekitar 15-30° (sedang bergerak)
+ *    High : nilai sekitar 30-50° (sudut puncak FES)
+ *
+ *  Input 2: kecepatan sudut sendi wrist (deg/s)
+ *    Low  : lambat / diam
+ *    Med  : kecepatan sedang
+ *    High : kecepatan tinggi / puncak gerakan
+ *
+ *  Sesuaikan nilai-nilai ini dengan range gerak pasien yang diuji.
+ * ---------------------------------------------------------------- */
+#define WRIST_FUZZY_ANG_LOW    10.0f   /* angle MF Low  — center (deg) */
+#define WRIST_FUZZY_ANG_MED    25.0f   /* angle MF Med  — center (deg) */
+#define WRIST_FUZZY_ANG_HIGH   40.0f   /* angle MF High — center (deg) */
+#define WRIST_FUZZY_ANG_WIDTH  20.0f   /* angle MF width (deg) */
+#define WRIST_FUZZY_VEL_LOW     5.0f   /* velocity MF Low  — center (deg/s) */
+#define WRIST_FUZZY_VEL_MED    15.0f   /* velocity MF Med  — center (deg/s) */
+#define WRIST_FUZZY_VEL_HIGH   25.0f   /* velocity MF High — center (deg/s) */
+#define WRIST_FUZZY_VEL_WIDTH  15.0f   /* velocity MF width (deg/s) */
+
+/* ----------------------------------------------------------------
+ *  Parameter Membership Function Fuzzy — ELBOW joint
+ *
+ *  Input 1: sudut sendi elbow (elbow_joint_angle, deg)
+ *    Low  : ekstensi hampir penuh (~0-20°)
+ *    Med  : fleksi setengah (~20-60°)
+ *    High : fleksi puncak (~60-90°)
+ *
+ *  Input 2: kecepatan sudut sendi elbow (deg/s)
+ * ---------------------------------------------------------------- */
+#define ELBOW_FUZZY_ANG_LOW    20.0f
+#define ELBOW_FUZZY_ANG_MED    45.0f
+#define ELBOW_FUZZY_ANG_HIGH   70.0f
+#define ELBOW_FUZZY_ANG_WIDTH  30.0f
+#define ELBOW_FUZZY_VEL_LOW    10.0f
+#define ELBOW_FUZZY_VEL_MED    25.0f
+#define ELBOW_FUZZY_VEL_HIGH   40.0f
+#define ELBOW_FUZZY_VEL_WIDTH  20.0f
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
+
+TIM_HandleTypeDef htim1;
+
+UART_HandleTypeDef huart1;
+
+/* USER CODE BEGIN PV */
+
+/* ================================================================
+ *  ADC DMA BUFFER
+ *  [BARU] Diperbesar dari 6 → 9 channel
+ *
+ *  Index mapping:
+ *    [0] = ACC1_X  (IMU1 Hand)
+ *    [1] = GYRO1_Y (IMU1 Hand)
+ *    [2] = ACC1_Z  (IMU1 Hand)
+ *    [3] = ACC2_X  (IMU2 Forearm)
+ *    [4] = GYRO2_Y (IMU2 Forearm)
+ *    [5] = ACC2_Z  (IMU2 Forearm)
+ *    [6] = ACC3_X  (IMU3 Upper Arm)   [BARU]
+ *    [7] = GYRO3_Y (IMU3 Upper Arm)   [BARU]
+ *    [8] = ACC3_Z  (IMU3 Upper Arm)   [BARU]
+ * ================================================================ */
+uint16_t adc_raw[9];      /* [BARU] 6 → 9 */
+char uart_buf[512];        /* [BARU] 256 → 512 untuk 15 kolom */
+
+/* ================================================================
+ *  BIAS KALIBRASI — Per IMU
+ * ================================================================ */
+
+/* IMU1 (Hand) */
+float acc1_x_bias_v  = 0;
+float acc1_z_bias_v  = 0;
+float gyro1_y_bias_v = 0;
+
+/* IMU2 (Forearm) */
+float acc2_x_bias_v  = 0;
+float acc2_z_bias_v  = 0;
+float gyro2_y_bias_v = 0;
+
+/* [BARU] IMU3 (Upper Arm) */
+float acc3_x_bias_v  = 0;
+float acc3_z_bias_v  = 0;
+float gyro3_y_bias_v = 0;
+
+/* ================================================================
+ *  OFFSET SUDUT AWAL
+ * ================================================================ */
+float angle1_offset = 0;
+float angle2_offset = 0;
+float angle3_offset = 0;
+
+/* ================================================================
+ *  IMU 1 — TELAPAK TANGAN (HAND)
+ * ================================================================ */
+float acc1_x, acc1_z, gyro1_y;
+float acc1_x_f = 0, acc1_z_f = 0, gyro1_y_f = 0;
+float angle1 = 0, angle1_acc = 0, angle1_gyro = 0;
+
+/* ================================================================
+ *  IMU 2 — LENGAN BAWAH (FOREARM)
+ * ================================================================ */
+float acc2_x, acc2_z, gyro2_y;
+float acc2_x_f = 0, acc2_z_f = 0, gyro2_y_f = 0;
+float angle2 = 0, angle2_acc = 0, angle2_gyro = 0;
+
+/* ================================================================
+ *  [BARU] IMU 3 — LENGAN ATAS (UPPER ARM / BICEP)
+ * ================================================================ */
+float acc3_x, acc3_z, gyro3_y;
+float acc3_x_f = 0, acc3_z_f = 0, gyro3_y_f = 0;
+float angle3 = 0, angle3_acc = 0, angle3_gyro = 0;
+
+/* ================================================================
+ *  SUDUT SENDI
+ * ================================================================ */
+float wrist_joint_angle = 0;   /* wrist = angle1 - angle2 */
+float elbow_joint_angle = 0;   /* [BARU] elbow = angle3 - angle2 */
+
+/* ================================================================
+ *  TIMING
+ * ================================================================ */
+float dt = 0.01f;
+uint32_t last_loop_tick = 0;
+
+/* ================================================================
+ *  KONSTANTA SENSOR
+ * ================================================================ */
+#define RAD_TO_DEG 57.2957795f
+#define ACC_ZERO_G_V 1.65f //0g = Vcc/2 = 1.65V
+#define ACC_SENS_V_PER_G 0.3f // Dari datasheet typical : 300 mV/g → 0.3 V/g
+#define GYRO_SENS_V_PER_DPS 0.0067f // Dari datasheet typical : 0.67 mV/(°/s) → 0.0067 V/(°/s)
+#define CALIB_DURATION_MS 5000U
+#define LOOP_DELAY_MS 10U
+#define DT_MIN_S 0.005f
+#define DT_MAX_S 0.030f
+#define PI 3.141592653589793f
+#define TWO_PI 6.283185307f
+
+/* Butterworth LPF orde-2: Fs=100Hz, Fc=5Hz */
+#define BQ_A1 1.6474599811f
+#define BQ_A2 0.7008967812f
+#define BQ_B0 0.0133592000f
+#define BQ_B1 0.0267184001f
+#define BQ_B2 0.0133592000f
+
+/* Kalman 1D Covariance */
+#define KALMAN_Q_ANGLE 0.001f
+#define KALMAN_Q_GYRO 0.003f
+#define KALMAN_R_ANGLE 0.001f
+
+
+/* Konfigurasi */
+#define USE_KALMAN_1D 1
+#define USE_BUTTERWORTH_FILTER 1
+#define WRIST_SIGN 1.0f
+#define ELBOW_SIGN 1.0f        /* [BARU] 1.0f atau -1.0f sesuai orientasi */
+
+/* Auto kalibrasi gyro saat diam (ON/OFF) */
+#define ENABLE_AUTO_GYRO_REBIAS 1
+#define AUTO_REBIAS_GYRO_TH_DPS 1.5f
+#define AUTO_REBIAS_HOLD_MS 2000U
+#define AUTO_REBIAS_ALPHA 0.01f
+
+/* Kalibrasi linear terhadap goniometer: y = a*x + b */
+#define ENABLE_LINEAR_GONIO_CAL 1
+#define WRIST_CAL_A 0.9985f // Taruh 1 kalo linear
+#define WRIST_CAL_B 1.6806f // Taruh 0 kalo linear
+#define ELBOW_CAL_A 0.9985f
+#define ELBOW_CAL_B 1.6806f
+
+/* PID trajectory tracking untuk 2 joint */
+#define ENABLE_PID_CONTROL 1
+#define PID_PWM_MIN 0.0f
+#define PID_PWM_MAX 10.0f
+
+#define WRIST_TRAJ_ENABLE 1
+#define WRIST_TRAJ_AMP_DEG 20.0f
+#define WRIST_TRAJ_FREQ_HZ 0.20f
+#define WRIST_TRAJ_OFFSET_DEG 0.0f
+
+#define ELBOW_TRAJ_ENABLE 0
+#define ELBOW_TRAJ_AMP_DEG 30.0f
+#define ELBOW_TRAJ_FREQ_HZ 0.20f
+#define ELBOW_TRAJ_OFFSET_DEG 0.0f
+
+#define WRIST_KP 1.20f
+#define WRIST_KI 0.10f
+#define WRIST_KD 0.02f
+
+#define ELBOW_KP 1.20f
+#define ELBOW_KI 0.10f
+#define ELBOW_KD 0.02f
+
+#define PID_I_LIMIT 10.0f
+
+/* Complementary filter fallback */
+#define COMP_GYRO_WEIGHT 0.96f
+#define COMP_ACC_WEIGHT 0.04f
+
+/* ================================================================
+ *  STATE FILTER INSTANCES
+ * ================================================================ */
+
+/* IMU1 filter */
+BiquadLPFState lpf1_acc_x  = {0};
+BiquadLPFState lpf1_acc_z  = {0};
+BiquadLPFState lpf1_gyro_y = {0};
+
+/* IMU2 filter */
+BiquadLPFState lpf2_acc_x  = {0};
+BiquadLPFState lpf2_acc_z  = {0};
+BiquadLPFState lpf2_gyro_y = {0};
+
+/* [BARU] IMU3 filter */
+BiquadLPFState lpf3_acc_x  = {0};
+BiquadLPFState lpf3_acc_z  = {0};
+BiquadLPFState lpf3_gyro_y = {0};
+
+/* Kalman filter */
+Kalman1DState kf1 = {0};
+Kalman1DState kf2 = {0};
+Kalman1DState kf3 = {0};   /* [BARU] */
+
+uint32_t stationary_since_tick = 0;
+
+float control_time_s = 0.0f;
+float wrist_setpoint_deg = 0.0f;
+float elbow_setpoint_deg = 0.0f;
+
+float wrist_err = 0.0f, wrist_err_prev = 0.0f, wrist_err_int = 0.0f;
+float elbow_err = 0.0f, elbow_err_prev = 0.0f, elbow_err_int = 0.0f;
+
+float wrist_pid_u = 0.0f;
+float elbow_pid_u = 0.0f;
+
+float tilt1, tilt2, tilt3;
+float gyro1_dps_out, gyro2_dps_out, gyro3_dps_out;
+
+/* ================================================================
+ *  VARIABEL FITUR TAMBAHAN
+ * ================================================================ */
+
+/* UART Trigger */
+#if ENABLE_UART_TRIGGER
+uint8_t rx_data_buf[1];
+uint8_t system_running = 0;   /* 0 = tunggu trigger, 1 = aktif */
+#else
+uint8_t system_running = 1;   /* langsung aktif */
+#endif
+
+/* Fuzzy-PID per joint */
+#if ENABLE_FUZZY_CONTROL
+float wrist_fuzzy_ica = 0.0f;       /* Fuzzy ICA output wrist */
+float elbow_fuzzy_ica = 0.0f;       /* Fuzzy ICA output elbow */
+float wrist_fes_duty  = 0.0f;       /* Final FES duty wrist (Fuzzy+PID) */
+float elbow_fes_duty  = 0.0f;       /* Final FES duty elbow (Fuzzy+PID) */
+/* Kecepatan sudut sendi — dihitung dari diferensial joint angle tiap loop */
+float wrist_joint_vel       = 0.0f; /* kecepatan sudut wrist (deg/s) */
+float elbow_joint_vel       = 0.0f; /* kecepatan sudut elbow (deg/s) */
+float wrist_joint_angle_prev = 0.0f;/* sudut wrist loop sebelumnya */
+float elbow_joint_angle_prev = 0.0f;/* sudut elbow loop sebelumnya */
+#endif
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_TIM1_Init(void);
+static void MX_USART1_UART_Init(void);
+
+/* USER CODE BEGIN PFP */
+float adc_to_voltage(uint16_t adc);
+float acc_voltage_to_g(float v);
+float gyro_voltage_to_dps(float v);
+float biquad_lpf_step(BiquadLPFState *s, float input);
+void  biquad_lpf_reset(BiquadLPFState *s);
+float kalman_1d_update(Kalman1DState *kf, float angle_meas, float gyro_rate_dps, float dt_s);
+void  kalman_1d_reset(Kalman1DState *kf, float init_angle);
+void  calibrate_imu(void);
+
+#if TRAJ_PATTERN_TYPE == 1
+float trapezoidal_wave(float time_s, float amp, float offset);
+#endif
+
+#if ENABLE_FUZZY_CONTROL
+float lefttrap(float a, float b, float x);
+float triangle_mf(float a, float b, float x);
+float righttrap(float a, float b, float x);
+float compute_fuzzy_ica(float velocity, float angle,
+                        float ang_a, float ang_b, float ang_c, float ang_w,
+                        float vel_a, float vel_b, float vel_c, float vel_w);
+float compute_fuzzy_intensity(float ica, float pid_u);
+#endif
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_ADC1_Init();
+  MX_TIM1_Init();
+  MX_USART1_UART_Init();
+
+  /* USER CODE BEGIN 2 */
+
+  /* [BARU] Start ADC DMA: 9 channel (sebelumnya 6) */
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_raw, 9);
+
+  calibrate_imu();
+  last_loop_tick = HAL_GetTick();
+
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+#if ENABLE_PID_CONTROL
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
+#else
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 1);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 1);
+#endif
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, GPIO_PIN_RESET);
+
+#if ENABLE_UART_TRIGGER
+  HAL_UART_Receive_IT(&huart1, rx_data_buf, 1);
+#endif
+
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+    /* Timing: tunggu hingga periode loop minimum tercapai,
+     * lalu hitung dt aktual dari selisih tick real.
+     */
+      uint32_t now_tick;
+      do
+      {
+          now_tick = HAL_GetTick();
+      }
+      while ((now_tick - last_loop_tick) < LOOP_DELAY_MS);
+
+      dt = (now_tick - last_loop_tick) * 0.001f;
+      if (dt < DT_MIN_S) dt = DT_MIN_S;
+      if (dt > DT_MAX_S) dt = DT_MAX_S;
+      last_loop_tick = now_tick;
+      control_time_s += dt;
+
+		  /* ============================================================
+		   *  IMU 1 — HAND (adc_raw[0..2])
+		   * ============================================================ */
+
+		  float acc1_x_v  = adc_to_voltage(adc_raw[0]);
+		  float gyro1_y_v = adc_to_voltage(adc_raw[1]);
+		  float acc1_z_v  = adc_to_voltage(adc_raw[2]);
+
+		  acc1_x  = acc_voltage_to_g(acc1_x_v - acc1_x_bias_v);
+		  acc1_z  = acc_voltage_to_g(acc1_z_v - acc1_z_bias_v);
+		  gyro1_y = gyro_voltage_to_dps(gyro1_y_v - gyro1_y_bias_v);
+
+		  tilt1 = angle1_acc;           // dari accelerometer
+		  gyro1_dps_out = gyro1_y_f;    // sudah dalam dps
+
+	  #if USE_BUTTERWORTH_FILTER
+		  acc1_x_f  = biquad_lpf_step(&lpf1_acc_x, acc1_x);
+		  acc1_z_f  = biquad_lpf_step(&lpf1_acc_z, acc1_z);
+		  gyro1_y_f = biquad_lpf_step(&lpf1_gyro_y, gyro1_y);
+	  #else
+		  acc1_x_f = acc1_x;
+		  acc1_z_f = acc1_z;
+		  gyro1_y_f = gyro1_y;
+	  #endif
+
+		  angle1_acc = atan2f(acc1_x_f, acc1_z_f) * RAD_TO_DEG - angle1_offset;
+		  angle1_gyro += gyro1_y_f * dt;
+
+	  #if USE_KALMAN_1D
+		  angle1 = kalman_1d_update(&kf1, angle1_acc, gyro1_y_f, dt);
+	  #else
+		  angle1 = COMP_GYRO_WEIGHT * (angle1 + gyro1_y_f * dt)
+				 + COMP_ACC_WEIGHT * angle1_acc;
+	  #endif
+
+		  /* ============================================================
+		   *  IMU 2 — FOREARM (adc_raw[3..5])
+		   * ============================================================ */
+
+		  float acc2_x_v  = adc_to_voltage(adc_raw[3]);
+		  float gyro2_y_v = adc_to_voltage(adc_raw[4]);
+		  float acc2_z_v  = adc_to_voltage(adc_raw[5]);
+
+		  acc2_x  = acc_voltage_to_g(acc2_x_v - acc2_x_bias_v);
+		  acc2_z  = acc_voltage_to_g(acc2_z_v - acc2_z_bias_v);
+		  gyro2_y = gyro_voltage_to_dps(gyro2_y_v - gyro2_y_bias_v);
+
+		  tilt2 = angle2_acc;
+		  gyro2_dps_out = gyro2_y_f;
+
+	  #if USE_BUTTERWORTH_FILTER
+		  acc2_x_f  = biquad_lpf_step(&lpf2_acc_x, acc2_x);
+		  acc2_z_f  = biquad_lpf_step(&lpf2_acc_z, acc2_z);
+		  gyro2_y_f = biquad_lpf_step(&lpf2_gyro_y, gyro2_y);
+	  #else
+		  acc2_x_f = acc2_x;
+		  acc2_z_f = acc2_z;
+		  gyro2_y_f = gyro2_y;
+	  #endif
+
+		  angle2_acc = atan2f(acc2_x_f, acc2_z_f) * RAD_TO_DEG - angle2_offset;
+		  angle2_gyro += gyro2_y_f * dt;
+
+	  #if USE_KALMAN_1D
+		  angle2 = kalman_1d_update(&kf2, angle2_acc, gyro2_y_f, dt);
+	  #else
+		  angle2 = COMP_GYRO_WEIGHT * (angle2 + gyro2_y_f * dt)
+				 + COMP_ACC_WEIGHT * angle2_acc;
+	  #endif
+
+		  /* ============================================================
+		   *  IMU 3 — UPPER ARM / BICEP (adc_raw[6..8])
+		   *
+		   *  Sama persis pipeline-nya dengan IMU1 dan IMU2:
+		   *    ADC → Voltage → Bias removal → g/dps → LPF → Angle
+		   *
+		   *  Channel mapping:
+		   *    adc_raw[6] = ACC3_X  (accelerometer sumbu X)
+		   *    adc_raw[7] = GYRO3_Y (gyroscope sumbu Y)
+		   *    adc_raw[8] = ACC3_Z  (accelerometer sumbu Z)
+		   * ============================================================ */
+
+		  float acc3_x_v  = adc_to_voltage(adc_raw[6]);
+		  float gyro3_y_v = adc_to_voltage(adc_raw[7]);
+		  float acc3_z_v  = adc_to_voltage(adc_raw[8]);
+
+		  acc3_x  = acc_voltage_to_g(acc3_x_v - acc3_x_bias_v);
+		  acc3_z  = acc_voltage_to_g(acc3_z_v - acc3_z_bias_v);
+		  gyro3_y = gyro_voltage_to_dps(gyro3_y_v - gyro3_y_bias_v);
+
+		  tilt3 = angle3_acc;
+		  gyro3_dps_out = gyro3_y_f;
+
+	  #if USE_BUTTERWORTH_FILTER
+		  acc3_x_f  = biquad_lpf_step(&lpf3_acc_x, acc3_x);
+		  acc3_z_f  = biquad_lpf_step(&lpf3_acc_z, acc3_z);
+		  gyro3_y_f = biquad_lpf_step(&lpf3_gyro_y, gyro3_y);
+	  #else
+		  acc3_x_f = acc3_x;
+		  acc3_z_f = acc3_z;
+		  gyro3_y_f = gyro3_y;
+	  #endif
+
+		  /* Sudut IMU3 dari accelerometer */
+		  angle3_acc = atan2f(acc3_x_f, acc3_z_f) * RAD_TO_DEG - angle3_offset;
+
+		  /* Integrasi gyroscope IMU3 */
+		  angle3_gyro += gyro3_y_f * dt;
+
+		  /* Sensor fusion IMU3 */
+	  #if USE_KALMAN_1D
+		  angle3 = kalman_1d_update(&kf3, angle3_acc, gyro3_y_f, dt);
+	  #else
+		  angle3 = COMP_GYRO_WEIGHT * (angle3 + gyro3_y_f * dt)
+				 + COMP_ACC_WEIGHT * angle3_acc;
+	  #endif
+
+    #if ENABLE_AUTO_GYRO_REBIAS
+      /* Re-bias gyro hanya jika semua IMU stabil selama beberapa detik. */
+      if ((fabsf(gyro1_y_f) < AUTO_REBIAS_GYRO_TH_DPS) &&
+        (fabsf(gyro2_y_f) < AUTO_REBIAS_GYRO_TH_DPS) &&
+        (fabsf(gyro3_y_f) < AUTO_REBIAS_GYRO_TH_DPS))
+      {
+        if (stationary_since_tick == 0U)
+        {
+          stationary_since_tick = now_tick;
+        }
+
+        if ((now_tick - stationary_since_tick) >= AUTO_REBIAS_HOLD_MS)
+        {
+          gyro1_y_bias_v = ((1.0f - AUTO_REBIAS_ALPHA) * gyro1_y_bias_v) +
+                   (AUTO_REBIAS_ALPHA * gyro1_y_v);
+          gyro2_y_bias_v = ((1.0f - AUTO_REBIAS_ALPHA) * gyro2_y_bias_v) +
+                   (AUTO_REBIAS_ALPHA * gyro2_y_v);
+          gyro3_y_bias_v = ((1.0f - AUTO_REBIAS_ALPHA) * gyro3_y_bias_v) +
+                   (AUTO_REBIAS_ALPHA * gyro3_y_v);
+        }
+      }
+      else
+      {
+        stationary_since_tick = 0U;
+      }
+    #endif
+
+		  /* ============================================================
+		   *  HITUNG SUDUT SENDI
+		   * ============================================================
+		   *
+		   *  WRIST (pergelangan tangan):
+		   *    = angle_hand - angle_forearm
+		   *    = angle1 - angle2
+		   *    Positif = dorsiflexion, Negatif = palmar flexion
+		   *
+		   *  ELBOW (siku):
+		   *    = angle_upperarm - angle_forearm
+		   *    = angle3 - angle2
+		   *    Positif = ekstensi (lurus), Negatif = fleksi (tekuk)
+		   *
+		   *    Catatan: tergantung orientasi sensor, mungkin perlu
+		   *    balik tanda (ELBOW_SIGN = -1.0f) atau tukar
+		   *    menjadi angle2 - angle3. Test dulu!
+		   * ============================================================ */
+		  wrist_joint_angle = WRIST_SIGN * (angle1 - angle2);
+		  elbow_joint_angle = ELBOW_SIGN * (angle3 - angle2);   // cek dan pastikan
+
+    #if ENABLE_LINEAR_GONIO_CAL
+      wrist_joint_angle = (WRIST_CAL_A * wrist_joint_angle) + WRIST_CAL_B;
+      elbow_joint_angle = (ELBOW_CAL_A * elbow_joint_angle) + ELBOW_CAL_B;
+    #endif
+
+    #if ENABLE_PID_CONTROL
+      /* Setpoint trajectory (sinus) */
+      /* Jalankan kontrol PID + FES hanya ketika sistem aktif.
+       * Jika system_running == 0, PWM sudah di-set 0 oleh UART callback
+       * (karakter 'g') sehingga FES aman dimatikan. */
+      if (system_running)
+      {
+        /* ---- Setpoint trajectory ---- */
+      wrist_setpoint_deg = WRIST_TRAJ_OFFSET_DEG;
+      elbow_setpoint_deg = ELBOW_TRAJ_OFFSET_DEG;
+
+	#if WRIST_TRAJ_ENABLE
+		#if TRAJ_PATTERN_TYPE == 0
+		wrist_setpoint_deg += WRIST_TRAJ_AMP_DEG *
+			   sinf(TWO_PI * WRIST_TRAJ_FREQ_HZ * control_time_s);
+		#else
+		wrist_setpoint_deg = trapezoidal_wave(control_time_s,
+											 WRIST_TRAJ_AMP_DEG,
+											 WRIST_TRAJ_OFFSET_DEG);
+		#endif
+	#endif
+
+     #if ELBOW_TRAJ_ENABLE
+		#if TRAJ_PATTERN_TYPE == 0
+				  elbow_setpoint_deg += ELBOW_TRAJ_AMP_DEG *
+						  sinf(TWO_PI * ELBOW_TRAJ_FREQ_HZ * control_time_s);
+				#else
+				  elbow_setpoint_deg = trapezoidal_wave(control_time_s,
+														ELBOW_TRAJ_AMP_DEG,
+														ELBOW_TRAJ_OFFSET_DEG);
+				#endif
+      #endif
+
+      /* Error berbasis sudut joint final (setelah kalibrasi jika enable) */
+      wrist_err = wrist_setpoint_deg - wrist_joint_angle;
+      elbow_err = elbow_setpoint_deg - elbow_joint_angle;
+
+      wrist_err_int += wrist_err * dt;
+      elbow_err_int += elbow_err * dt;
+
+      if (wrist_err_int > PID_I_LIMIT) wrist_err_int = PID_I_LIMIT;
+      if (wrist_err_int < -PID_I_LIMIT) wrist_err_int = -PID_I_LIMIT;
+      if (elbow_err_int > PID_I_LIMIT) elbow_err_int = PID_I_LIMIT;
+      if (elbow_err_int < -PID_I_LIMIT) elbow_err_int = -PID_I_LIMIT;
+
+      float wrist_d = (wrist_err - wrist_err_prev) / dt;
+      float elbow_d = (elbow_err - elbow_err_prev) / dt;
+
+      wrist_pid_u = (WRIST_KP * wrist_err) + (WRIST_KI * wrist_err_int) +
+                    (WRIST_KD * wrist_d);
+      elbow_pid_u = (ELBOW_KP * elbow_err) + (ELBOW_KI * elbow_err_int) +
+                    (ELBOW_KD * elbow_d);
+
+      if (wrist_pid_u < PID_PWM_MIN) wrist_pid_u = PID_PWM_MIN;
+      if (wrist_pid_u > PID_PWM_MAX) wrist_pid_u = PID_PWM_MAX;
+      if (elbow_pid_u < PID_PWM_MIN) elbow_pid_u = PID_PWM_MIN;
+      if (elbow_pid_u > PID_PWM_MAX) elbow_pid_u = PID_PWM_MAX;
+
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (uint32_t)wrist_pid_u);
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, (uint32_t)elbow_pid_u);
+
+      /* ---- FES Output (Fuzzy-PID atau PID murni) ---- */
+           #if ENABLE_FUZZY_CONTROL
+             /* Hitung kecepatan sudut sendi dari diferensial sudut joint per dt.
+              * Ini lebih representatif dari raw gyro karena mencerminkan gerakan
+              * sendi relatif (bukan gerakan absolut satu IMU). */
+             wrist_joint_vel = (wrist_joint_angle - wrist_joint_angle_prev) / dt;
+             elbow_joint_vel = (elbow_joint_angle - elbow_joint_angle_prev) / dt;
+             wrist_joint_angle_prev = wrist_joint_angle;
+             elbow_joint_angle_prev = elbow_joint_angle;
+
+             /* Hitung Fuzzy ICA per joint dengan parameter MF yang dikonfigurasi
+              * terpisah untuk wrist dan elbow via macro WRIST/ELBOW_FUZZY_*. */
+             wrist_fuzzy_ica = compute_fuzzy_ica(
+                 wrist_joint_vel, wrist_joint_angle,
+                 WRIST_FUZZY_ANG_LOW,  WRIST_FUZZY_ANG_MED,
+                 WRIST_FUZZY_ANG_HIGH, WRIST_FUZZY_ANG_WIDTH,
+                 WRIST_FUZZY_VEL_LOW,  WRIST_FUZZY_VEL_MED,
+                 WRIST_FUZZY_VEL_HIGH, WRIST_FUZZY_VEL_WIDTH);
+
+             elbow_fuzzy_ica = compute_fuzzy_ica(
+                 elbow_joint_vel, elbow_joint_angle,
+                 ELBOW_FUZZY_ANG_LOW,  ELBOW_FUZZY_ANG_MED,
+                 ELBOW_FUZZY_ANG_HIGH, ELBOW_FUZZY_ANG_WIDTH,
+                 ELBOW_FUZZY_VEL_LOW,  ELBOW_FUZZY_VEL_MED,
+                 ELBOW_FUZZY_VEL_HIGH, ELBOW_FUZZY_VEL_WIDTH);
+
+             /* Gabungkan Fuzzy ICA + PID */
+             wrist_fes_duty = compute_fuzzy_intensity(wrist_fuzzy_ica, wrist_pid_u);
+             elbow_fes_duty = compute_fuzzy_intensity(elbow_fuzzy_ica, elbow_pid_u);
+
+             if (wrist_fes_duty < PID_PWM_MIN) wrist_fes_duty = PID_PWM_MIN;
+             if (wrist_fes_duty > PID_PWM_MAX) wrist_fes_duty = PID_PWM_MAX;
+             if (elbow_fes_duty < PID_PWM_MIN) elbow_fes_duty = PID_PWM_MIN;
+             if (elbow_fes_duty > PID_PWM_MAX) elbow_fes_duty = PID_PWM_MAX;
+
+             __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (uint32_t)wrist_fes_duty);
+             __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, (uint32_t)elbow_fes_duty);
+           #else
+             __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (uint32_t)wrist_pid_u);
+             __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, (uint32_t)elbow_pid_u);
+           #endif
+
+           wrist_err_prev = wrist_err;
+           elbow_err_prev = elbow_err;
+         }
+         /* system_running == 0: PWM sudah di-set 0 oleh UART callback */
+         #endif
+
+		  /* ============================================================
+		   *  KIRIM DATA CSV VIA UART (15 kolom)
+		   * ============================================================
+		   * KIRIM DATA CSV VIA UART
+		   *
+		   *  Kolom  0-2  : adc_raw IMU1 (hand)
+		   *  Kolom  3-5  : adc_raw IMU2 (forearm)
+		   *  Kolom  6-8  : adc_raw IMU3 (upper arm)    [BARU]
+		   *  Kolom  9    : angle1 (sudut fused hand)
+		   *  Kolom  10   : angle2 (sudut fused forearm)
+		   *  Kolom  11   : angle3 (sudut fused upper arm) [BARU]
+		   *  Kolom  12   : wrist_joint_angle (opsional setelah y=ax+b)
+		   *  Kolom  13   : elbow_joint_angle (opsional setelah y=ax+b)
+		   *  Kolom  14   : (reserved, 0 untuk sekarang)
+		   *  Format CSV (27 kolom):
+		   *  Kolom  1-6  : IMU1 (acc_x, acc_z, gyro_y, tilt, gyro_dps, angle)
+		   *  Kolom  7-12 : IMU2 (sama)
+		   *  Kolom 13-18 : IMU3 (sama)
+		   *  Kolom 19-20 : Sudut sendi (wrist, elbow)
+		   *  Kolom 21-23 : Wrist control (setpoint, error, pid_u)
+		   *  Kolom 24-26 : Elbow control (setpoint, error, pid_u)
+		   *  Kolom 27    : system_running flag
+		   * ============================================================ */
+
+//		  sprintf(uart_buf,
+//				  "%u,%u,%u,%u,%u,%u,%u,%u,%u,"
+//				  "%.3f,%.3f,%.3f,"
+//				  "%.3f,%.3f,%.3f\r\n",
+//				  /* Kolom 0-8: ADC raw semua 9 channel */
+//				  adc_raw[0], adc_raw[1], adc_raw[2],
+//				  adc_raw[3], adc_raw[4], adc_raw[5],
+//				  adc_raw[6], adc_raw[7], adc_raw[8],
+//				  /* Kolom 9-11: Sudut fused per IMU */
+//				  angle1, angle2, angle3,
+//				  /* Kolom 12-14: Sudut sendi + reserved */
+//          wrist_joint_angle,
+//          elbow_joint_angle,
+//				  0.0f);   /* reserved untuk nanti */
+//
+//		  HAL_UART_Transmit(&huart1,
+//							(uint8_t*)uart_buf,
+//							strlen(uart_buf),
+//							50);
+		  sprintf(uart_buf,
+		      /* IMU1 */
+		      "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
+		      /* IMU2 */
+		      "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
+		      /* IMU3 */
+		      "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
+			  /* Joint angles */
+			  "%.3f,%.3f,"
+			  /* Wrist control */
+			  "%.3f,%.3f,%.3f,"
+			  /* Elbow control */
+			  "%.3f,%.3f,%.3f,"
+			  /* Status */
+			  "%u\r\n",
+
+		      /* IMU1 */
+		      acc1_x_f, acc1_z_f, gyro1_y_f,
+		      tilt1, gyro1_dps_out, angle1,
+
+		      /* IMU2 */
+		      acc2_x_f, acc2_z_f, gyro2_y_f,
+		      tilt2, gyro2_dps_out, angle2,
+
+		      /* IMU3 */
+		      acc3_x_f, acc3_z_f, gyro3_y_f,
+		      tilt3, gyro3_dps_out, angle3,
+
+			  /* Joint angles */
+		      wrist_joint_angle,
+			  elbow_joint_angle,
+
+			  		      /* Wrist control */
+			  		      wrist_setpoint_deg, wrist_err, wrist_pid_u,
+
+			  		      /* Elbow control */
+			  		      elbow_setpoint_deg, elbow_err, elbow_pid_u,
+
+			  		      /* Status */
+			  		      (unsigned)system_running
+			  		  );
+
+			  		  HAL_UART_Transmit(&huart1,
+			  		                    (uint8_t*)uart_buf,
+			  		                    strlen(uart_buf),
+			  		                    50);
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
+  PeriphClkInit.AdcClockSelection = RCC_ADCPCLK2_DIV6;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Common config
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
+  hadc1.Init.ContinuousConvMode = ENABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 9;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_1;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_2;
+  sConfig.Rank = ADC_REGULAR_RANK_2;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_3;
+  sConfig.Rank = ADC_REGULAR_RANK_3;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_4;
+  sConfig.Rank = ADC_REGULAR_RANK_4;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_5;
+  sConfig.Rank = ADC_REGULAR_RANK_5;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_6;
+  sConfig.Rank = ADC_REGULAR_RANK_6;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_7;
+  sConfig.Rank = ADC_REGULAR_RANK_7;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_8;
+  sConfig.Rank = ADC_REGULAR_RANK_8;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_9;
+  sConfig.Rank = ADC_REGULAR_RANK_9;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 72-1;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 100-1;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
+  HAL_TIM_MspPostInit(&htim1);
+
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* Fungsi konversi */
+float adc_to_voltage(uint16_t adc)
+{
+	return (adc * 3.3f) / 4095.0f;
+}
+
+float acc_voltage_to_g(float v)
+{
+	return v / ACC_SENS_V_PER_G;
+}
+
+float gyro_voltage_to_dps(float v)
+{
+	return v / GYRO_SENS_V_PER_DPS;
+}
+
+/* Biquad LPF */
+float biquad_lpf_step(BiquadLPFState *s, float input)
+{
+    float out = (BQ_A1 * s->y1) - (BQ_A2 * s->y2)
+              + (BQ_B0 * input) + (BQ_B1 * s->x1) + (BQ_B2 * s->x2);
+    s->x2 = s->x1; s->x1 = input;
+    s->y2 = s->y1; s->y1 = out;
+    return out;
+}
+
+void biquad_lpf_reset(BiquadLPFState *s)
+{
+    s->x1 = 0; s->x2 = 0; s->y1 = 0; s->y2 = 0;
+}
+
+/* Kalman */
+float kalman_1d_update(Kalman1DState *kf, float angle_meas, float gyro_rate_dps, float dt_s)
+{
+    float rate = gyro_rate_dps - kf->bias;
+    kf->angle += rate * dt_s;
+    kf->p00 += dt_s * (dt_s * kf->p11 - kf->p01 - kf->p10 + KALMAN_Q_ANGLE);
+    kf->p01 -= dt_s * kf->p11;
+    kf->p10 -= dt_s * kf->p11;
+    kf->p11 += KALMAN_Q_GYRO * dt_s;
+    float innovation = angle_meas - kf->angle;
+    float s = kf->p00 + KALMAN_R_ANGLE;
+    if (s < 1.0e-6f) s = 1.0e-6f;
+    float k0 = kf->p00 / s;
+    float k1 = kf->p10 / s;
+    kf->angle += k0 * innovation;
+    kf->bias += k1 * innovation;
+    float p00_tmp = kf->p00, p01_tmp = kf->p01;
+    kf->p00 -= k0 * p00_tmp;
+    kf->p01 -= k0 * p01_tmp;
+    kf->p10 -= k1 * p00_tmp;
+    kf->p11 -= k1 * p01_tmp;
+    return kf->angle;
+}
+
+void kalman_1d_reset(Kalman1DState *kf, float init_angle)
+{
+    kf->angle = init_angle;
+    kf->bias = 0.0f;
+    kf->p00 = 1.0f;
+    kf->p01 = 0.0f;
+    kf->p10 = 0.0f;
+    kf->p11 = 1.0f;
+}
+
+/* ================================================================
+ *  KALIBRASI 3 IMU
+ *
+ *  Perubahan dari versi 2 IMU:
+ *    - Tambah akumulasi gyro3 bias
+ *    - Tambah akumulasi angle3 offset
+ *    - Tambah reset variabel IMU3
+ *    - Tambah reset filter IMU3 (LPF + Kalman)
+ * ================================================================ */
+void calibrate_imu(void)
+{
+    float sum_gyro1_y_v = 0, sum_gyro2_y_v = 0, sum_gyro3_y_v = 0;
+    float sum_angle1 = 0, sum_angle2 = 0, sum_angle3 = 0;
+    uint32_t samples = 0;
+    uint32_t t0 = HAL_GetTick();
+
+    HAL_Delay(500);
+
+    while ((HAL_GetTick() - t0) < CALIB_DURATION_MS)
+    {
+        /* Akumulasi bias gyroscope */
+        sum_gyro1_y_v += adc_to_voltage(adc_raw[1]);
+        sum_gyro2_y_v += adc_to_voltage(adc_raw[4]);
+        sum_gyro3_y_v += adc_to_voltage(adc_raw[7]);   /* [BARU] */
+
+        /* Hitung sudut accelerometer untuk offset */
+        float a1x = acc_voltage_to_g(adc_to_voltage(adc_raw[0]) - ACC_ZERO_G_V);
+        float a1z = acc_voltage_to_g(adc_to_voltage(adc_raw[2]) - ACC_ZERO_G_V);
+        float a2x = acc_voltage_to_g(adc_to_voltage(adc_raw[3]) - ACC_ZERO_G_V);
+        float a2z = acc_voltage_to_g(adc_to_voltage(adc_raw[5]) - ACC_ZERO_G_V);
+        float a3x = acc_voltage_to_g(adc_to_voltage(adc_raw[6]) - ACC_ZERO_G_V);   /* [BARU] */
+        float a3z = acc_voltage_to_g(adc_to_voltage(adc_raw[8]) - ACC_ZERO_G_V);   /* [BARU] */
+
+        sum_angle1 += atan2f(a1x, a1z) * RAD_TO_DEG;
+        sum_angle2 += atan2f(a2x, a2z) * RAD_TO_DEG;
+        sum_angle3 += atan2f(a3x, a3z) * RAD_TO_DEG;   /* [BARU] */
+
+        samples++;
+        HAL_Delay(5);
+    }
+
+    if (samples == 0U) samples = 1U;
+    float inv = 1.0f / (float)samples;
+
+    /* IMU1 bias */
+    acc1_x_bias_v  = ACC_ZERO_G_V;
+    acc1_z_bias_v  = ACC_ZERO_G_V;
+    gyro1_y_bias_v = sum_gyro1_y_v * inv;
+
+    /* IMU2 bias */
+    acc2_x_bias_v  = ACC_ZERO_G_V;
+    acc2_z_bias_v  = ACC_ZERO_G_V;
+    gyro2_y_bias_v = sum_gyro2_y_v * inv;
+
+    /* [BARU] IMU3 bias */
+    acc3_x_bias_v  = ACC_ZERO_G_V;
+    acc3_z_bias_v  = ACC_ZERO_G_V;
+    gyro3_y_bias_v = sum_gyro3_y_v * inv;
+
+    /* Offset sudut awal */
+    angle1_offset = sum_angle1 * inv;
+    angle2_offset = sum_angle2 * inv;
+    angle3_offset = sum_angle3 * inv;   /* [BARU] */
+
+    /* Reset semua variabel sudut */
+    angle1 = 0; angle2 = 0; angle3 = 0;   /* [BARU] angle3 */
+    angle1_gyro = 0; angle2_gyro = 0; angle3_gyro = 0;   /* [BARU] */
+    wrist_joint_angle = 0;
+    elbow_joint_angle = 0;   /* [BARU] */
+
+    control_time_s = 0.0f;
+    wrist_setpoint_deg = 0.0f;
+    elbow_setpoint_deg = 0.0f;
+    wrist_err = 0.0f; wrist_err_prev = 0.0f; wrist_err_int = 0.0f;
+    elbow_err = 0.0f; elbow_err_prev = 0.0f; elbow_err_int = 0.0f;
+    wrist_pid_u = 0.0f;
+    elbow_pid_u = 0.0f;
+
+
+#if ENABLE_FUZZY_CONTROL
+    wrist_joint_angle_prev = 0.0f;
+    elbow_joint_angle_prev = 0.0f;
+    wrist_joint_vel = 0.0f;
+    elbow_joint_vel = 0.0f;
+#endif
+
+    /* Reset filtered values */
+    acc1_x_f = 0; acc1_z_f = 0; gyro1_y_f = 0;
+    acc2_x_f = 0; acc2_z_f = 0; gyro2_y_f = 0;
+    acc3_x_f = 0; acc3_z_f = 0; gyro3_y_f = 0;   /* [BARU] */
+
+    /* Reset Biquad LPF */
+    biquad_lpf_reset(&lpf1_acc_x);
+    biquad_lpf_reset(&lpf1_acc_z);
+    biquad_lpf_reset(&lpf1_gyro_y);
+    biquad_lpf_reset(&lpf2_acc_x);
+    biquad_lpf_reset(&lpf2_acc_z);
+    biquad_lpf_reset(&lpf2_gyro_y);
+    biquad_lpf_reset(&lpf3_acc_x);    /* [BARU] */
+    biquad_lpf_reset(&lpf3_acc_z);    /* [BARU] */
+    biquad_lpf_reset(&lpf3_gyro_y);   /* [BARU] */
+
+    /* Reset Kalman */
+    kalman_1d_reset(&kf1, 0.0f);
+    kalman_1d_reset(&kf2, 0.0f);
+    kalman_1d_reset(&kf3, 0.0f);   /* [BARU] */
+
+    /* Reset state auto re-bias gyro */
+    stationary_since_tick = 0U;
+
+    /* ================================================================
+     *  [BARU] TRAPEZOIDAL WAVE GENERATOR
+     *
+     *  Menghasilkan gelombang trapesium periodik dengan:
+     *    - Fase naik   (T_RISE) : ramp dari offset ke offset+amp
+     *    - Fase puncak (T_PEAK) : tahan di offset+amp
+     *    - Fase turun  (T_FALL) : ramp dari offset+amp ke offset
+     *    - Fase dasar  (T_BASE) : tahan di offset (fase istirahat otot)
+     * ================================================================ */
+    #if TRAJ_PATTERN_TYPE == 1
+    float trapezoidal_wave(float time_s, float amp, float offset)
+    {
+        float t_mod = fmodf(time_s, T_TOTAL);
+        if (t_mod < T_RISE) {
+            return (amp / T_RISE) * t_mod + offset;
+        } else if (t_mod < (T_RISE + T_PEAK)) {
+            return amp + offset;
+        } else if (t_mod < (T_RISE + T_PEAK + T_FALL)) {
+            return amp - (amp / T_FALL) * (t_mod - (T_RISE + T_PEAK)) + offset;
+        } else {
+            return offset;
+        }
+    }
+    #endif
+
+    /* ================================================================
+     *  [BARU] FUZZY LOGIC — Membership Functions & Rule Base
+     *
+     *  Port dari KodeKatingIMUSingleJoint, direfaktor menjadi modular
+     *  sehingga bisa dipanggil terpisah untuk Wrist maupun Elbow.
+     *
+     *  Referensi:
+     *    lefttrap / triangle_mf / righttrap : fungsi membership
+     *    compute_fuzzy_ica()  : fuzzifikasi + rule base + defuzzifikasi
+     *    compute_fuzzy_intensity() : kombinasi ICA + PID → duty FES
+     * ================================================================ */
+    #if ENABLE_FUZZY_CONTROL
+
+    /* Left trapezoid membership function
+     *   Nilai 1 untuk x <= a, turun linear ke 0 di x = a + b/2 */
+    float lefttrap(float a, float b, float x)
+    {
+        if (x <= a) return 1.0f;
+        if (x <= a + b / 2.0f) return 1.0f - 2.0f * fabsf(x - a) / b;
+        return 0.0f;
+    }
+
+    /* Triangle membership function
+     *   Puncak 1 di x = a, turun ke 0 di x = a ± b/2 */
+    float triangle_mf(float a, float b, float x)
+    {
+        if (x >= a - b / 2.0f && x <= a + b / 2.0f)
+            return 1.0f - 2.0f * fabsf(x - a) / b;
+        return 0.0f;
+    }
+
+    /* Right trapezoid membership function
+     *   Naik dari 0 di x = a - b/2 menuju 1 untuk x >= a
+     *   Note: denominator 2*b (bukan b) mempertahankan perilaku asli kode kating. */
+    float righttrap(float a, float b, float x)
+    {
+        if (x >= a) return 1.0f;
+        if (x >= a - b / 2.0f) return 1.0f - 2.0f * fabsf(x - a) / (2.0f * b);
+        return 0.0f;
+    }
+
+    /* Internal defuzzification helper (centroid method) */
+    #define DEFUZZ_EPSILON 1.0e-6f   /* threshold to avoid division by near-zero */
+    static float _defuzzify(float aggregated[], float out_range[], int n)
+    {
+        float numerator = 0.0f, denominator = 0.0f;
+        int i;
+        for (i = 0; i < n; i++) {
+            numerator   += aggregated[i] * out_range[i];
+            denominator += aggregated[i];
+        }
+        if (denominator < DEFUZZ_EPSILON) return 0.0f;
+        return numerator / denominator;
+    }
+
+    /*
+     * compute_fuzzy_ica()
+     *   velocity : kecepatan sudut sendi (deg/s), dari d(joint_angle)/dt
+     *   angle    : sudut sendi saat ini (deg)
+     *   ang_a/b/c: center membership function Low/Med/High untuk angle
+     *   ang_w    : lebar (width) membership function angle
+     *   vel_a/b/c: center membership function Low/Med/High untuk velocity
+     *   vel_w    : lebar (width) membership function velocity
+     *   return   : ICA (Intended Cognitive Activity) — range 0..~1
+     *
+     *  Rule base 3×3 (angle: Low/Med/High, velocity: Low/Med/High):
+     *    ang_Low  + vel_Low  → output HIGH
+     *    ang_Low  + vel_Med  → output MED
+     *    ang_Low  + vel_High → output MED
+     *    ang_Med  + vel_Low  → output LOW
+     *    ang_Med  + vel_Med  → output MED
+     *    ang_Med  + vel_High → output HIGH
+     *    ang_High + vel_Low  → output MED
+     *    ang_High + vel_Med  → output HIGH
+     *    ang_High + vel_High → output HIGH
+     */
+    float compute_fuzzy_ica(float velocity, float angle,
+                            float ang_a, float ang_b, float ang_c, float ang_w,
+                            float vel_a, float vel_b, float vel_c, float vel_w)
+    {
+        float miu_ang[3], miu_vel[3];
+        float u_ica[3] = {0.0f, 0.0f, 0.0f};
+        float out_mf[3][20];
+        float aggregated_output[20] = {0};
+        float out_range[20];
+        float temp_ica;
+        int i, j;
+
+        /* Fuzzifikasi sudut — menggunakan parameter per-joint */
+        miu_ang[0] = lefttrap(ang_a, ang_w, angle);
+        miu_ang[1] = triangle_mf(ang_b, ang_w, angle);
+        miu_ang[2] = righttrap(ang_c, ang_w, angle);
+
+        /* Fuzzifikasi kecepatan — menggunakan parameter per-joint */
+        miu_vel[0] = lefttrap(vel_a, vel_w, velocity);
+        miu_vel[1] = triangle_mf(vel_b, vel_w, velocity);
+        miu_vel[2] = righttrap(vel_c, vel_w, velocity);
+
+        /* Rule base */
+        /* 1. ang_Low + vel_Low → HIGH */
+        temp_ica = 0.0f;
+        if (miu_ang[0] > 0.0f && miu_vel[0] > 0.0f)
+            temp_ica = fminf(miu_ang[0], miu_vel[0]);
+        u_ica[2] = fmaxf(u_ica[2], temp_ica);
+
+        /* 2. ang_Low + vel_Med → MED */
+        temp_ica = 0.0f;
+        if (miu_ang[0] > 0.0f && miu_vel[1] > 0.0f)
+            temp_ica = fminf(miu_ang[0], miu_vel[1]);
+        u_ica[1] = fmaxf(u_ica[1], temp_ica);
+
+        /* 3. ang_Low + vel_High → MED */
+        temp_ica = 0.0f;
+        if (miu_ang[0] > 0.0f && miu_vel[2] > 0.0f)
+            temp_ica = fminf(miu_ang[0], miu_vel[2]);
+        u_ica[1] = fmaxf(u_ica[1], temp_ica);
+
+        /* 4. ang_Med + vel_Low → LOW */
+        temp_ica = 0.0f;
+        if (miu_ang[1] > 0.0f && miu_vel[0] > 0.0f)
+            temp_ica = fminf(miu_ang[1], miu_vel[0]);
+        u_ica[0] = fmaxf(u_ica[0], temp_ica);
+
+        /* 5. ang_Med + vel_Med → MED */
+        temp_ica = 0.0f;
+        if (miu_ang[1] > 0.0f && miu_vel[1] > 0.0f)
+            temp_ica = fminf(miu_ang[1], miu_vel[1]);
+        u_ica[1] = fmaxf(u_ica[1], temp_ica);
+
+        /* 6. ang_Med + vel_High → HIGH */
+        temp_ica = 0.0f;
+        if (miu_ang[1] > 0.0f && miu_vel[2] > 0.0f)
+            temp_ica = fminf(miu_ang[1], miu_vel[2]);
+        u_ica[2] = fmaxf(u_ica[2], temp_ica);
+
+        /* 7. ang_High + vel_Low → MED */
+        temp_ica = 0.0f;
+        if (miu_ang[2] > 0.0f && miu_vel[0] > 0.0f)
+            temp_ica = fminf(miu_ang[2], miu_vel[0]);
+        u_ica[1] = fmaxf(u_ica[1], temp_ica);
+
+        /* 8. ang_High + vel_Med → HIGH */
+        temp_ica = 0.0f;
+        if (miu_ang[2] > 0.0f && miu_vel[1] > 0.0f)
+            temp_ica = fminf(miu_ang[2], miu_vel[1]);
+        u_ica[2] = fmaxf(u_ica[2], temp_ica);
+
+        /* 9. ang_High + vel_High → HIGH */
+        temp_ica = 0.0f;
+        if (miu_ang[2] > 0.0f && miu_vel[2] > 0.0f)
+            temp_ica = fminf(miu_ang[2], miu_vel[2]);
+        u_ica[2] = fmaxf(u_ica[2], temp_ica);
+
+        /* Output membership functions (range 0 → 2.0) */
+        for (i = 0; i < 20; i++) {
+            out_range[i] = (float)i / 10.0f;
+            out_mf[0][i] = lefttrap(0.6f, 0.4f, out_range[i]);
+            out_mf[1][i] = triangle_mf(1.0f, 0.4f, out_range[i]);
+            out_mf[2][i] = righttrap(1.4f, 0.4f, out_range[i]);
+        }
+
+        /* Agregasi output */
+        for (i = 0; i < 20; i++) {
+            for (j = 0; j < 3; j++) {
+                aggregated_output[i] = fmaxf(aggregated_output[i],
+                                             fminf(u_ica[j], out_mf[j][i]));
+            }
+        }
+
+        /* Defuzzifikasi (centroid) → ICA dinormalisasi × 0.5 */
+        float ica = _defuzzify(aggregated_output, out_range, 20);
+        return ica * 0.5f;
+    }
+
+    /*
+     * compute_fuzzy_intensity()
+     *   ica   : Fuzzy ICA dari compute_fuzzy_ica()
+     *   pid_u : PID output (sudah ter-clamp di [PID_PWM_MIN, PID_PWM_MAX])
+     *   return: Combined FES duty ≥ 0
+     *
+     *  Rumus:  duty = (FUZZY_WEIGHT_CA × ica) + (FUZZY_WEIGHT_FDBK × pid_u/2)
+     *  Sesuai formula duty.if_ dari kode asli kating.
+     */
+    float compute_fuzzy_intensity(float ica, float pid_u)
+    {
+        float duty = (FUZZY_WEIGHT_CA * ica) + (FUZZY_WEIGHT_FDBK * (pid_u / 2.0f));
+        if (duty < 0.0f) duty = 0.0f;
+        return duty;
+    }
+
+    #endif /* ENABLE_FUZZY_CONTROL */
+
+    /* ================================================================
+     *  [BARU] UART TRIGGER CALLBACK
+     *
+     *  Karakter 'd' → mulai FES (system_running = 1)
+     *  Karakter 'g' → stop  FES (system_running = 0, PWM = 0)
+     * ================================================================ */
+    #if ENABLE_UART_TRIGGER
+    void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+    {
+        if (huart->Instance == USART1) {
+            if (rx_data_buf[0] == 'd') {
+                system_running = 1;
+            } else if (rx_data_buf[0] == 'g') {
+                system_running = 0;
+                __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
+                __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
+            }
+            HAL_UART_Receive_IT(&huart1, rx_data_buf, 1);
+        }
+    }
+    #endif
+
+}
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
